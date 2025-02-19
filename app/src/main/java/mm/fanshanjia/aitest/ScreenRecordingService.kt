@@ -1,18 +1,25 @@
 package mm.fanshanjia.aitest
 
+import android.Manifest
+import android.app.Activity
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
 import android.content.ContentValues
+import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraManager
 import android.hardware.display.DisplayManager
 import android.hardware.display.VirtualDisplay
-import android.media.*
+import android.media.MediaCodec
+import android.media.MediaCodecInfo
+import android.media.MediaCodecList
+import android.media.MediaFormat
+import android.media.MediaMuxer
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
 import android.net.Uri
@@ -31,10 +38,7 @@ import androidx.core.app.ActivityCompat
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import java.io.File
-import java.nio.ByteBuffer
-import android.Manifest
-import android.app.Activity
-import android.content.Context
+import android.media.MediaScannerConnection
 
 class ScreenRecordingService : Service() {
     companion object {
@@ -321,11 +325,13 @@ class ScreenRecordingService : Service() {
 
     private fun getOutputFilePath(): String {
         val timestamp = System.currentTimeMillis()
-        val directory = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_PICTURES)
+        val directory = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_MOVIES)
+//        val directoryA = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_PICTURES)///sdcard/Pictures/Screenshots
+//        val directory=File(directoryA,"Screenshots")
         if (!directory.exists()) {
             directory.mkdirs()
         }
-        val file = File(directory, "screen_recording_$timestamp.mp4")
+        val file = File(directory, "SVID_$timestamp.mp4")
         currentVideoPath = file.absolutePath
         return currentVideoPath.toString()
     }
@@ -529,7 +535,7 @@ class ScreenRecordingService : Service() {
                     }
                 }
 
-                // 插入媒体库
+                // 将视频插入媒体库
                 val uri = contentResolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values)
 
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
@@ -539,37 +545,52 @@ class ScreenRecordingService : Service() {
                     uri?.let { contentResolver.update(it, values, null, null) }
                 }
 
-                // 发送广播通知媒体库更新
-                if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
-                    val intent = Intent(Intent.ACTION_MEDIA_SCANNER_SCAN_FILE).apply {
-                        data = Uri.fromFile(file)
-                    }
-                    sendBroadcast(intent)
-                }
-
-                Log.i(TAG, "视频已添加到媒体库")
-
-                // 在 addVideoToMediaStore 方法最后添加
-                Handler(Looper.getMainLooper()).postDelayed({
-                    // 检查文件是否已添加到媒体库
-                    val cursor = contentResolver.query(
-                        MediaStore.Video.Media.EXTERNAL_CONTENT_URI,
-                        null,
-                        MediaStore.Video.Media.DISPLAY_NAME + "=?",
-                        arrayOf(file.name),
-                        null
-                    )
-                    cursor?.use {
-                        if (it.moveToFirst()) {
-                            Log.i(TAG, "确认视频已成功添加到媒体库")
-                        } else {
-                            Log.e(TAG, "视频可能未成功添加到媒体库")
-                        }
-                    }
-                }, 1000)
+                // 使用多种方式通知媒体库
+                notifyMediaScanner(file)
+                
+                Log.i(TAG, "视频已添加到媒体库: ${file.absolutePath}")
             } catch (e: Exception) {
                 Log.e(TAG, "添加视频到媒体库失败", e)
             }
+        }
+    }
+
+    // 新增方法：使用多种方式通知媒体扫描器
+    private fun notifyMediaScanner(file: File) {
+        try {
+            // 方式1：使用 MediaScannerConnection
+            MediaScannerConnection.scanFile(
+                applicationContext,
+                arrayOf(file.absolutePath),
+                arrayOf("video/mp4")
+            ) { path, uri ->
+                Log.i(TAG, "MediaScanner 扫描完成: $path -> $uri")
+            }
+
+            // 方式2：发送广播（适用于较老的系统版本）
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+                val intent = Intent(Intent.ACTION_MEDIA_SCANNER_SCAN_FILE).apply {
+                    data = Uri.fromFile(file)
+                }
+                sendBroadcast(intent)
+            }
+
+            // 方式3：通知图库更新
+            val intent = Intent(Intent.ACTION_MEDIA_SCANNER_SCAN_FILE)
+            intent.data = Uri.fromFile(file)
+            sendBroadcast(intent)
+
+            // 方式4：强制刷新特定目录
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.KITKAT) {
+                val paths = arrayOf(
+                    Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_MOVIES).absolutePath
+                )
+                MediaScannerConnection.scanFile(applicationContext, paths, null) { path, uri ->
+                    Log.i(TAG, "目录扫描完成: $path -> $uri")
+                }
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "通知媒体扫描器失败", e)
         }
     }
 }
