@@ -7,6 +7,8 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.ContentValues
 import android.content.Intent
+import android.hardware.camera2.CameraCharacteristics
+import android.hardware.camera2.CameraManager
 import android.hardware.display.DisplayManager
 import android.hardware.display.VirtualDisplay
 import android.media.*
@@ -19,33 +21,37 @@ import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import android.provider.MediaStore
+import android.util.DisplayMetrics
 import android.util.Log
 import android.view.Surface
+import android.view.WindowManager
 import androidx.core.app.NotificationCompat
 import java.io.File
 import java.nio.ByteBuffer
 
 class ScreenRecordingService : Service() {
     companion object {
-        private const val TAG = "ScreenRecordingService"
-        private const val VIDEO_WIDTH = 1280
-        private const val VIDEO_HEIGHT = 720
-        private const val VIDEO_BITRATE = 5000000 // 5Mbps
-        private const val FRAME_RATE = 30
-        private const val I_FRAME_INTERVAL = 1
-        private const val SPEED_FACTOR = 10L // 0.1倍速
-        private const val TIMEOUT_USEC = 10000L
+        private const val TAG = "ScreenRecordingService"  // 日志标签
+        private const val SPEED_FACTOR = 10L // 速度因子（0.1倍速）
+        private const val TIMEOUT_USEC = 10000L  // 超时时间（微秒）
     }
 
-    private var mediaProjection: MediaProjection? = null
-    private var virtualDisplay: VirtualDisplay? = null
-    private var mediaCodec: MediaCodec? = null
-    private var mediaMuxer: MediaMuxer? = null
-    private var surface: Surface? = null
-    private var isRecording = false
-    private var videoTrackIndex = -1
-    private var currentVideoPath: String? = null
-    private var mediaProjectionCallback: MediaProjection.Callback? = null
+    // 动态参数
+    private var videoWidth = 1280    // 视频宽度
+    private var videoHeight = 720    // 视频高度
+    private var videoBitRate = 0     // 视频比特率
+    private var frameRate = 30       // 帧率
+    private var screenDensity = 1    // 屏幕密度
+
+    private var mediaProjection: MediaProjection? = null  // 媒体投影，用于屏幕捕获
+    private var virtualDisplay: VirtualDisplay? = null    // 虚拟显示器
+    private var mediaCodec: MediaCodec? = null           // 媒体编码器
+    private var mediaMuxer: MediaMuxer? = null          // 媒体混合器
+    private var surface: Surface? = null                 // 录制表面
+    private var isRecording = false                      // 录制状态标志
+    private var videoTrackIndex = -1                     // 视频轨道索引
+    private var currentVideoPath: String? = null         // 当前视频保存路径
+    private var mediaProjectionCallback: MediaProjection.Callback? = null  // 媒体投影回调
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -82,30 +88,136 @@ class ScreenRecordingService : Service() {
         }
     }
 
-    private fun setupMediaCodec() {
-        val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, VIDEO_WIDTH, VIDEO_HEIGHT).apply {
-            setInteger(MediaFormat.KEY_BIT_RATE, VIDEO_BITRATE)
-            setInteger(MediaFormat.KEY_FRAME_RATE, FRAME_RATE)
-            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, I_FRAME_INTERVAL)
-            setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
+    private fun initRecordingParams() {
+        // 获取屏幕参数
+        val windowManager = getSystemService(WindowManager::class.java)
+        val display = windowManager.defaultDisplay
+        val metrics = DisplayMetrics()
+        display.getRealMetrics(metrics)
+
+        // 设置屏幕密度
+        screenDensity = metrics.densityDpi
+
+        // 设置视频分辨率（根据屏幕分辨率调整，但限制最大值）
+        videoWidth = metrics.widthPixels
+        videoHeight = metrics.heightPixels
+
+        // 如果分辨率太高，按比例缩小
+        val maxDimension = 1920 // 最大支持1920x1080
+        if (videoWidth > maxDimension || videoHeight > maxDimension) {
+            val ratio = videoWidth.toFloat() / videoHeight.toFloat()
+            if (videoWidth > videoHeight) {
+                videoWidth = maxDimension
+                videoHeight = (maxDimension / ratio).toInt()
+            } else {
+                videoHeight = maxDimension
+                videoWidth = (maxDimension * ratio).toInt()
+            }
         }
 
-        mediaCodec = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC).apply {
+        // 设置比特率（根据分辨率动态计算）
+        videoBitRate = calculateBitRate(videoWidth, videoHeight)
+
+        // 获取最优帧率
+        frameRate = getOptimalFrameRate()
+
+        Log.i(TAG, """
+            录制参数：
+            分辨率: ${videoWidth}x${videoHeight}
+            比特率: $videoBitRate
+            帧率: $frameRate
+            屏幕密度: $screenDensity
+        """.trimIndent())
+    }
+
+    private fun calculateBitRate(width: Int, height: Int): Int {
+        // 基础比特率计算公式：width * height * frameRate * 0.07 (系数可调)
+        val baseBitRate = (width * height * frameRate * 0.07).toInt()
+        
+        // 限制最小和最大比特率
+        val minBitRate = 1_000_000  // 1 Mbps
+        val maxBitRate = 10_000_000 // 10 Mbps
+        
+        return baseBitRate.coerceIn(minBitRate, maxBitRate)
+    }
+
+    private fun getOptimalFrameRate(): Int {
+        try {
+            // 获取支持的帧率范围
+            val cameraManager = getSystemService(CAMERA_SERVICE) as CameraManager
+            val cameraId = cameraManager.cameraIdList[0]
+            val characteristics = cameraManager.getCameraCharacteristics(cameraId)
+            val fpsRanges = characteristics.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)
+            
+            // 选择最适合的帧率
+            return fpsRanges?.maxByOrNull { it.upper }?.upper ?: 30
+        } catch (e: Exception) {
+            Log.e(TAG, "获取最优帧率失败，使用默认值30", e)
+            return 30
+        }
+    }
+
+    private fun setupMediaCodec() {
+        // 初始化录制参数
+        initRecordingParams()
+
+        val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, videoWidth, videoHeight).apply {
+            setInteger(MediaFormat.KEY_BIT_RATE, videoBitRate)
+            setInteger(MediaFormat.KEY_FRAME_RATE, frameRate)
+            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
+            setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
+            
+            // 设置编码器性能模式
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                setInteger(MediaFormat.KEY_QUALITY, 100)
+                setInteger(MediaFormat.KEY_PRIORITY, 0)  // 实时编码优先级
+                setInteger(MediaFormat.KEY_LATENCY, 0)   // 低延迟模式
+            }
+        }
+
+        // 选择最优编码器
+        val codecName = selectCodec(MediaFormat.MIMETYPE_VIDEO_AVC)
+        if (codecName != null) {
+            mediaCodec = MediaCodec.createByCodecName(codecName)
+        } else {
+            mediaCodec = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
+        }
+
+        mediaCodec?.apply {
             configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
             surface = createInputSurface()
             start()
         }
 
         // 创建输出文件和MediaMuxer
-//        currentVideoPath = "${getExternalFilesDir(null)}/screen_recording_${System.currentTimeMillis()}.mp4"
         currentVideoPath = getOutputFilePath()
         Log.e(TAG, "创建输出文件和MediaMuxer"+currentVideoPath)
         mediaMuxer = MediaMuxer(currentVideoPath!!, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
     }
 
+    private fun selectCodec(mimeType: String): String? {
+        val codecList = MediaCodecList(MediaCodecList.REGULAR_CODECS)
+        val codecInfo = codecList.codecInfos
+        
+        // 查找支持指定MIME类型的编码器
+        return codecInfo
+            .filter { it.isEncoder && it.supportedTypes.contains(mimeType) }
+            .maxByOrNull { getCodecPriority(it) }
+            ?.name
+    }
+
+    private fun getCodecPriority(codecInfo: MediaCodecInfo): Int {
+        // 优先选择硬件编码器
+        return when {
+            codecInfo.name.startsWith("c2.android") -> 3    // 新版硬件编码器
+            codecInfo.name.startsWith("OMX.google") -> 1    // 软件编码器
+            codecInfo.name.startsWith("OMX.") -> 2          // 旧版硬件编码器
+            else -> 0
+        }
+    }
+
     private fun getOutputFilePath(): String {
         val timestamp = System.currentTimeMillis()
-//        val directory = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_MOVIES)
         val directory = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_PICTURES)
         if (!directory.exists()) {
             directory.mkdirs()
@@ -116,7 +228,7 @@ class ScreenRecordingService : Service() {
     }
 
     private fun setupVirtualDisplay() {
-        // 创建并注册回调
+        // 创建媒体投影回调
         mediaProjectionCallback = object : MediaProjection.Callback() {
             override fun onStop() {
                 Log.i(TAG, "MediaProjection stopped")
@@ -130,7 +242,7 @@ class ScreenRecordingService : Service() {
         // 创建虚拟显示
         virtualDisplay = mediaProjection?.createVirtualDisplay(
             "ScreenRecorder",
-            VIDEO_WIDTH, VIDEO_HEIGHT, 1,
+            videoWidth, videoHeight, screenDensity,  // 使用实际的屏幕密度
             DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
             surface, null, null
         )
