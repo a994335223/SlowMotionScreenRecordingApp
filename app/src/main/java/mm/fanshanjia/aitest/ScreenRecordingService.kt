@@ -7,6 +7,7 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.ContentValues
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraManager
 import android.hardware.display.DisplayManager
@@ -21,19 +22,121 @@ import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import android.provider.MediaStore
+import android.provider.Settings
 import android.util.DisplayMetrics
 import android.util.Log
 import android.view.Surface
 import android.view.WindowManager
+import androidx.core.app.ActivityCompat
 import androidx.core.app.NotificationCompat
+import androidx.core.content.ContextCompat
 import java.io.File
 import java.nio.ByteBuffer
+import android.Manifest
+import android.app.Activity
+import android.content.Context
 
 class ScreenRecordingService : Service() {
     companion object {
         private const val TAG = "ScreenRecordingService"  // 日志标签
         private const val SPEED_FACTOR = 10L // 速度因子（0.1倍速）
         private const val TIMEOUT_USEC = 10000L  // 超时时间（微秒）
+        const val SCREEN_CAPTURE_REQUEST_CODE = 1001
+
+        fun checkPermissionsAndStartRecording(activity: Activity) {
+            when {
+                Build.VERSION.SDK_INT >= Build.VERSION_CODES.S -> {
+                    if (!hasRequiredPermissions(activity)) {
+                        requestPermissions(activity)
+                        return
+                    }
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && !Environment.isExternalStorageManager()) {
+                        requestManageStoragePermission(activity)
+                        return
+                    }
+                    startScreenCapture(activity)
+                }
+                else -> {
+                    if (hasRequiredPermissions(activity)) {
+                        startScreenCapture(activity)
+                    } else {
+                        requestPermissions(activity)
+                    }
+                }
+            }
+        }
+
+        private fun hasRequiredPermissions(context: Context): Boolean {
+            return getRequiredPermissions(context).all {
+                ContextCompat.checkSelfPermission(context, it) == PackageManager.PERMISSION_GRANTED
+            }
+        }
+
+        private fun getRequiredPermissions(context: Context): Array<String> {
+            return when {
+                Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE -> {
+                    arrayOf(
+                        Manifest.permission.RECORD_AUDIO,
+                        Manifest.permission.READ_MEDIA_VIDEO,
+                        Manifest.permission.READ_MEDIA_IMAGES,
+                        Manifest.permission.POST_NOTIFICATIONS,
+                        Manifest.permission.FOREGROUND_SERVICE,
+                        Manifest.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION
+                    )
+                }
+                // ... 其他版本的权限定义 ...
+                else -> {
+                    arrayOf(
+                        Manifest.permission.RECORD_AUDIO,
+                        Manifest.permission.WRITE_EXTERNAL_STORAGE,
+                        Manifest.permission.READ_EXTERNAL_STORAGE,
+                        Manifest.permission.FOREGROUND_SERVICE
+                    )
+                }
+            }
+        }
+
+        private fun requestPermissions(activity: Activity) {
+            ActivityCompat.requestPermissions(
+                activity,
+                getRequiredPermissions(activity),
+                SCREEN_CAPTURE_REQUEST_CODE
+            )
+        }
+
+        private fun requestManageStoragePermission(activity: Activity) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                try {
+                    val intent = Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION).apply {
+                        data = Uri.parse("package:${activity.packageName}")
+                    }
+                    activity.startActivity(intent)
+                } catch (e: Exception) {
+                    val intent = Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION)
+                    activity.startActivity(intent)
+                }
+            }
+        }
+
+        private fun startScreenCapture(activity: Activity) {
+            val mediaProjectionManager = activity.getSystemService(MediaProjectionManager::class.java)
+            activity.startActivityForResult(
+                mediaProjectionManager.createScreenCaptureIntent(),
+                SCREEN_CAPTURE_REQUEST_CODE
+            )
+        }
+
+        fun startService(context: Context, resultCode: Int, data: Intent) {
+            val serviceIntent = Intent(context, ScreenRecordingService::class.java).apply {
+                putExtra("resultCode", resultCode)
+                putExtra("resultData", data)
+            }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                context.startForegroundService(serviceIntent)
+            } else {
+                context.startService(serviceIntent)
+            }
+        }
     }
 
     // 动态参数
